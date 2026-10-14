@@ -115,7 +115,10 @@ function isConvex(q) {
 
 function pickFour(cands, layout) {
   const expectRatio = (layout.markerSize.small / layout.markerSize.large) ** 2;   // ≈0.34
-  const expectRel = layout.markerSize.large / (1 - layout.markerSize.large);     // 大マーカー辺 / 中心間距離
+  // 大マーカー辺 / 中心間距離（テンプレートごとの配置から求める）
+  const M = layout.markers;
+  const expectRel = layout.markerSize.large /
+    ((Math.hypot(M.TR[0] - M.TL[0], M.TR[1] - M.TL[1]) + Math.hypot(M.BL[0] - M.TL[0], M.BL[1] - M.TL[1])) / 2);
   const c = cands.slice(0, 10);
   let best = null;
   for (let i = 0; i < c.length; i++) for (let j = i + 1; j < c.length; j++)
@@ -267,9 +270,96 @@ export function toImageData(rgb, N, gains) {
   return id;
 }
 
-/** 一連の処理。full: 原寸 ImageData, small: 検出用縮小 ImageData */
-export function extract(full, small, layout) {
-  const det = detectMarkers(small, layout);
+// ---------------------------------------------------------------- マーカー消し（バルーン）
+/**
+ * 円の中を周囲の色からなめらかに埋める（ラプラス方程式をガウス・ザイデルで解く）。
+ * バルーンは体の中にマーカーがあるので、3D に貼る前に消す。
+ * discs: [{c:[x,y], r}]（テンプレート座標）
+ */
+export function inpaintDiscs(img, region, discs, iters = 350) {
+  const N = img.width, d = img.data;
+  const [x0, y0, x1, y1] = region;
+  for (const { c, r } of discs) {
+    const px = ((c[0] - x0) / (x1 - x0)) * N, py = ((c[1] - y0) / (y1 - y0)) * N;
+    const pr = (r / (x1 - x0)) * N;
+    const bx0 = Math.max(1, Math.floor(px - pr - 2)), by0 = Math.max(1, Math.floor(py - pr - 2));
+    const bx1 = Math.min(N - 2, Math.ceil(px + pr + 2)), by1 = Math.min(N - 2, Math.ceil(py + pr + 2));
+    const idx = [];
+    const ring = [0, 0, 0];
+    let nr = 0;
+    for (let y = by0; y <= by1; y++) for (let x = bx0; x <= bx1; x++) {
+      const dist = Math.hypot(x + 0.5 - px, y + 0.5 - py);
+      const i = (y * N + x) * 4;
+      if (dist < pr) idx.push(i);
+      else if (dist < pr + 2) { ring[0] += d[i]; ring[1] += d[i + 1]; ring[2] += d[i + 2]; nr++; }
+    }
+    if (!nr) continue;
+    const f = new Float32Array(d.length);   // 作業用（Uint8 だと丸めで収束が鈍る）
+    for (let i = 0; i < d.length; i++) f[i] = d[i];
+    for (const i of idx) for (let k = 0; k < 3; k++) f[i + k] = ring[k] / nr;   // 初期値はまわりの平均
+    const W = N * 4;
+    for (let it = 0; it < iters; it++) {
+      for (const i of idx) for (let k = 0; k < 3; k++) {
+        f[i + k] = (f[i + k - 4] + f[i + k + 4] + f[i + k - W] + f[i + k + W]) * 0.25;
+      }
+    }
+    for (const i of idx) for (let k = 0; k < 3; k++) d[i + k] = f[i + k];
+  }
+  return img;
+}
+
+/** 左右反転（バルーン裏面の絵を表と同じ座標系にそろえる） */
+export function mirrorX(img) {
+  const N = img.width, H = img.height, d = img.data;
+  const out = new ImageData(N, H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < N; x++) {
+    const s = (y * N + x) * 4, t = (y * N + (N - 1 - x)) * 4;
+    out.data[t] = d[s]; out.data[t + 1] = d[s + 1]; out.data[t + 2] = d[s + 2]; out.data[t + 3] = d[s + 3];
+  }
+  return out;
+}
+
+/** マーカー寸法 / 中心間距離。テンプレートごとに違うので、写っているのが紙かバルーンかの判別に使う */
+function relOf(q) {
+  const side = (Math.hypot(q.TR.cx - q.TL.cx, q.TR.cy - q.TL.cy) + Math.hypot(q.BL.cx - q.TL.cx, q.BL.cy - q.TL.cy) +
+    Math.hypot(q.BR.cx - q.BL.cx, q.BR.cy - q.BL.cy) + Math.hypot(q.BR.cx - q.TR.cx, q.BR.cy - q.TR.cy)) / 4;
+  return Math.sqrt((q.TL.area + q.TR.area + q.BL.area) / 3) / side;
+}
+function expectRelOf(t) {
+  const M = t.markers;
+  const side = (Math.hypot(M.TR[0] - M.TL[0], M.TR[1] - M.TL[1]) + Math.hypot(M.BL[0] - M.TL[0], M.BL[1] - M.TL[1]) +
+    Math.hypot(M.BR[0] - M.BL[0], M.BR[1] - M.BL[1]) + Math.hypot(M.BR[0] - M.TR[0], M.BR[1] - M.TR[1])) / 4;
+  return t.markerSize.large / side;
+}
+
+/**
+ * 写っているテンプレートを自動判別して抽出する。
+ * templates: { name: layout } / prefer: 先に試す名前
+ * 戻り値に template（判別した名前）を含む
+ */
+export function extractAuto(full, small, templates, prefer) {
+  const names = [prefer, ...Object.keys(templates).filter((n) => n !== prefer)];
+  let det = null;
+  for (const n of names) {
+    det = detectMarkers(small, templates[n]);
+    if (det.ok) break;
+  }
+  if (!det.ok) return det;
+  const rel = relOf(det.quad);
+  let best = names[0], bestErr = Infinity;
+  for (const n of names) {
+    const err = Math.abs(Math.log(rel / expectRelOf(templates[n])));
+    if (err < bestErr) { bestErr = err; best = n; }
+  }
+  const r = extract(full, small, templates[best], det);
+  r.template = best;
+  r.rel = rel;
+  return r;
+}
+
+/** 一連の処理。full: 原寸 ImageData, small: 検出用縮小 ImageData, det: 検出済みなら渡す */
+export function extract(full, small, layout, det = null) {
+  det = det || detectMarkers(small, layout);
   if (!det.ok) return det;
   const k = full.width / small.width;         // 検出は縮小、抽出は原寸から（§6-3）
   const keys = ["TL", "TR", "BR", "BL"];
@@ -279,5 +369,7 @@ export function extract(full, small, layout) {
   const N = layout.texSize;
   const rgb = warpRegion(full, H, layout.region, N);
   const gains = whiteGains(full, H, layout.whitePoints, layout.whiteRadius);
-  return { ok: true, image: toImageData(rgb, N, gains), gains, H, debug: det.debug };
+  const image = toImageData(rgb, N, gains);
+  if (layout.inpaint) inpaintDiscs(image, layout.region, layout.inpaint);
+  return { ok: true, image, gains, H, debug: det.debug };
 }

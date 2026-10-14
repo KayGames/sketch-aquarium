@@ -1,5 +1,6 @@
 // 水槽シーン（仕様 §3[8], §6-5）
 import * as THREE from "three";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const FISH_VERT = /* glsl */ `
   uniform float uTime, uSpeed, uWaveLength, uMaxAmp, uPhase0;
@@ -77,8 +78,69 @@ function radialTexture(inner, outer) {
   return new THREE.CanvasTexture(c);
 }
 
+/**
+ * 膨らんだバルーンの形をマスクから作る。輪郭からの距離で高さを決める「枕型」。
+ * 実物と同じく、平らなフィルムに刷った絵がそのまま膨らむので UV は平面のまま。
+ * 戻り値 { front, back }：表は +Z、裏は -Z。どちらも同じ UV（裏の絵は左右反転して渡す）
+ */
+function buildBalloonGeometry(maskImg, G = 128, puff = 0.14) {
+  const S = G + 1;
+  const c = document.createElement("canvas");
+  c.width = c.height = S;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(maskImg, 0, 0, S, S);
+  const md = g.getImageData(0, 0, S, S).data;
+  const m = new Float32Array(S * S);
+  for (let i = 0; i < S * S; i++) m[i] = md[i * 4] / 255;
+
+  // 高さ：内圧のかかった膜（Δh = -p、縁は 0）を SOR で解く。実際のバルーンのフィルムと同じ考え方で、
+  // 距離変換と違って中心線に折り目が出ない
+  const inside = new Uint8Array(S * S);
+  for (let y = 1; y < S - 1; y++) for (let x = 1; x < S - 1; x++) inside[y * S + x] = m[y * S + x] > 0.5 ? 1 : 0;
+  const memb = new Float32Array(S * S);
+  const omega = 1.9;
+  for (let it = 0; it < 500; it++) {
+    for (let i = S + 1; i < S * S - S - 1; i++) {
+      if (!inside[i]) continue;
+      memb[i] += omega * ((memb[i - 1] + memb[i + 1] + memb[i - S] + memb[i + S] + 1) / 4 - memb[i]);
+    }
+  }
+  let umax = 0;
+  for (let i = 0; i < S * S; i++) if (memb[i] > umax) umax = memb[i];
+  // 膜の解は放物線ぎみなので、平方根で縁を丸く立ち上げて中央を平らにする（アルミバルーンの枕型）
+  const hf = new Float32Array(S * S);
+  for (let i = 0; i < S * S; i++) hf[i] = Math.sqrt(memb[i] / Math.max(umax, 1e-6));
+
+  const pos = new Float32Array(S * S * 3), posB = new Float32Array(S * S * 3), uv = new Float32Array(S * S * 2);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const i = y * S + x, u = x / G, v = y / G;
+    const h = puff * hf[i];
+    pos[i * 3] = posB[i * 3] = u - 0.5;
+    pos[i * 3 + 1] = posB[i * 3 + 1] = 0.5 - v;
+    pos[i * 3 + 2] = h; posB[i * 3 + 2] = -h;
+    uv[i * 2] = u; uv[i * 2 + 1] = 1 - v;
+  }
+  const idx = [], idxB = [];
+  for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+    const a = y * S + x, b = a + 1, cc = a + S, d = cc + 1;
+    if (Math.max(m[a], m[b], m[cc], m[d]) < 0.02) continue;   // 輪郭の外は張らない（縁はアルファで切る）
+    idx.push(a, cc, b, b, cc, d);
+    idxB.push(a, b, cc, b, d, cc);
+  }
+  const make = (p, ix) => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(p, 3));
+    geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+    geo.setIndex(ix);
+    geo.computeVertexNormals();
+    return geo;
+  };
+  return { front: make(pos, idx), back: make(posB, idxB) };
+}
+
 export class Aquarium {
-  constructor(container, maskImage) {
+  /** masks: { flat: 紙のさかなのマスク画像, balloon: バルーンのマスク画像 } */
+  constructor(container, masks) {
     this.container = container;
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });   // 背後のカメラ映像を透かす
     this.renderer.setClearColor(0x000000, 0);
@@ -91,8 +153,15 @@ export class Aquarium {
     this.camera.position.set(0, 1.0, 10);
     this.camera.lookAt(0, 0, 0);
 
-    this.mask = new THREE.Texture(maskImage);
+    this.mask = new THREE.Texture(masks.flat);
     this.mask.needsUpdate = true;
+    this.balloonMask = new THREE.Texture(masks.balloon);
+    this.balloonMask.needsUpdate = true;
+    this.balloonGeo = buildBalloonGeometry(masks.balloon);
+
+    // バルーンのつや（フィルムの光沢）は環境マップの映り込みで出す
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     this.fish = [];
     this.time = 0;
     this.bounds = { x: 4, y: 2.5, zMin: -3, zMax: 1.5 };
@@ -194,7 +263,7 @@ export class Aquarium {
     const bgDist = this.camera.position.z - this.bg.position.z;
     const s = (bgDist / this.camera.position.z) * 2.3;
     this.bg.scale.set(halfW * s, halfH * s, 1);
-    for (const f of this.fish) f.mesh.scale.setScalar(this.fishSize * f.sizeK);
+    for (const f of this.fish) f.obj.scale.setScalar(this.fishSize * f.sizeK);
   }
 
   // ------------------------------------------------------------ 魚
@@ -216,10 +285,53 @@ export class Aquarium {
       transparent: true, side: THREE.DoubleSide, depthWrite: true,
     });
     const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, 24, 1), mat);
-    mesh.rotation.order = "YZX";
+    return this._addCreature(mesh, mat.uniforms, () => {
+      mesh.geometry.dispose(); map.dispose(); mat.dispose();
+    }, opt, { cruise: 0.9 + Math.random() * 0.6, bob: 0 });
+  }
+
+  /**
+   * 3D バルーン。front/back はどちらも表と同じ向き（頭が左）の絵。裏は呼び出し側で左右反転済み
+   */
+  addBalloon(frontSource, backSource, opt = {}) {
+    // くねり：魚と同じ式を MeshPhysicalMaterial の頂点処理に差し込む（表裏で同じ uniform を共有）
+    const wag = {
+      uTime: { value: 0 }, uSpeed: { value: 3 }, uWaveLength: { value: 2.6 },
+      uMaxAmp: { value: 0.12 }, uPhase0: { value: Math.random() * 6.28 },
+    };
+    const textures = [];
+    const makeMat = (src) => {
+      const map = new THREE.Texture(src);
+      map.colorSpace = THREE.SRGBColorSpace;
+      map.anisotropy = 4;
+      map.needsUpdate = true;
+      textures.push(map);
+      const mat = new THREE.MeshPhysicalMaterial({
+        map, alphaMap: this.balloonMask, alphaTest: 0.5,
+        roughness: 0.42, clearcoat: 0.8, clearcoatRoughness: 0.22, envMapIntensity: 0.75,
+      });
+      mat.onBeforeCompile = (sh) => {
+        Object.assign(sh.uniforms, wag);
+        sh.vertexShader = "uniform float uTime, uSpeed, uWaveLength, uMaxAmp, uPhase0;\n" +
+          sh.vertexShader.replace("#include <begin_vertex>", `#include <begin_vertex>
+            { float wx = uv.x;   // 0=頭, 1=尾
+              transformed.z += sin(uTime * uSpeed - wx * uWaveLength + uPhase0) * wx * wx * uMaxAmp; }`);
+      };
+      return mat;
+    };
+    const fm = makeMat(frontSource), bm = makeMat(backSource);
+    const group = new THREE.Group();
+    group.add(new THREE.Mesh(this.balloonGeo.front, fm), new THREE.Mesh(this.balloonGeo.back, bm));
+    return this._addCreature(group, wag, () => {
+      textures.forEach((t) => t.dispose()); fm.dispose(); bm.dispose();
+    }, opt, { cruise: 0.6 + Math.random() * 0.4, bob: 0.12 });
+  }
+
+  _addCreature(obj, u, dispose, opt, extra) {
+    obj.rotation.order = "YZX";
     const sizeK = 0.85 + Math.random() * 0.3;
-    mesh.scale.setScalar(this.fishSize * sizeK);
-    this.scene.add(mesh);
+    obj.scale.setScalar(this.fishSize * sizeK);
+    this.scene.add(obj);
 
     const shadow = new THREE.Mesh(new THREE.PlaneGeometry(1, 0.45),
       new THREE.MeshBasicMaterial({ map: this.shadowTex, transparent: true, depthWrite: false }));
@@ -229,13 +341,13 @@ export class Aquarium {
 
     const b = this.bounds;
     const f = {
-      id: opt.id, mesh, shadow, mat, sizeK,
+      id: opt.id, obj, u, shadow, sizeK, dispose,
       pos: opt.spawn ? new THREE.Vector3(0, 0, 3)
         : new THREE.Vector3((Math.random() * 2 - 1) * b.x, (Math.random() * 2 - 1) * b.y,
           b.zMin + Math.random() * (b.zMax - b.zMin)),
       vel: new THREE.Vector3(Math.random() < 0.5 ? -1 : 1, 0, 0),
       target: new THREE.Vector3(),
-      cruise: 0.9 + Math.random() * 0.6,
+      cruise: extra.cruise, bob: extra.bob, bobPh: Math.random() * 6.28,
       retargetAt: 0, yaw: 0, pitch: 0,
       born: opt.spawn ? this.time : -10,
     };
@@ -249,8 +361,8 @@ export class Aquarium {
     const i = this.fish.findIndex((f) => f.id === id);
     if (i < 0) return;
     const f = this.fish[i];
-    this.scene.remove(f.mesh, f.shadow);
-    f.mesh.geometry.dispose(); f.mat.uniforms.uMap.value.dispose(); f.mat.dispose();
+    this.scene.remove(f.obj, f.shadow);
+    f.dispose();
     f.shadow.geometry.dispose(); f.shadow.material.dispose();
     this.fish.splice(i, 1);
   }
@@ -299,10 +411,12 @@ export class Aquarium {
       const age = this.time - f.born;
       if (age > 0.9) this._swim(f, dt);
       const pop = age < 0.9 ? easeOutBack(Math.max(0, age) / 0.9) : 1;   // 放たれる瞬間（ar-popup 流用）
-      f.mesh.position.copy(f.pos);
-      f.mesh.rotation.set(0, f.yaw, f.pitch);
-      f.mesh.scale.setScalar(this.fishSize * f.sizeK * Math.max(0.001, pop));
-      const u = f.mat.uniforms;
+      f.obj.position.copy(f.pos);
+      // バルーンはふわふわ上下して、ゆっくり傾く
+      f.obj.position.y += Math.sin(this.time * 0.9 + f.bobPh) * f.bob;
+      f.obj.rotation.set(Math.sin(this.time * 0.7 + f.bobPh) * f.bob * 0.8, f.yaw, f.pitch);
+      f.obj.scale.setScalar(this.fishSize * f.sizeK * Math.max(0.001, pop));
+      const u = f.u;
       u.uTime.value = this.time;
       u.uSpeed.value = 3 + f.vel.length() * 3.5;
 

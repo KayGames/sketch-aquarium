@@ -6,7 +6,10 @@
 <meta name="theme-color" content="#04182e">
 <title>スケッチアクアリウム</title>
 <script type="importmap">
-  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  } }
 </script>
 <style>
   :root {
@@ -22,6 +25,22 @@
     overflow: hidden; -webkit-tap-highlight-color: transparent; }
   #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; display: none; }
   body.cam #cam { display: block; }
+  #cam.mirror { transform: scaleX(-1); }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  #flash.on { animation: flash .45s ease-out; }
+  @keyframes flash { from { opacity: .85; } to { opacity: 0; } }
+  .btn.round { width: 52px; padding: 0; font-size: 22px; }
+  body:not(.cam) #btn-flip { display: none; }
+  #preview { gap: 8px; }
+  #preview canvas { flex: 1; min-width: 0; }
+  #photo-img { display: block; width: 100%; max-height: 60vh; object-fit: contain; border-radius: 12px; margin-bottom: 14px; }
+  .seg { display: flex; gap: 8px; margin-bottom: 14px; }
+  .seg label { flex: 1; text-align: center; padding: 12px 8px; border-radius: 12px; background: rgba(255,255,255,.1);
+    cursor: pointer; font-weight: 700; }
+  .seg input { display: none; }
+  .seg label:has(input:checked) { background: var(--accent); color: var(--accent-ink); }
+  .btn[hidden] { display: none; }
+  .m-menu .btn { font-size: 14px; padding: 0 12px; white-space: nowrap; }
   #tank { position: fixed; inset: 0; }
   #tank canvas { display: block; }
 
@@ -36,8 +55,7 @@
   .dock { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; gap: 12px; justify-content: center;
     padding: 0 16px max(20px, env(safe-area-inset-bottom)); }
   .hint { flex-basis: 100%; margin: 0; text-align: center; font-size: 12px; color: var(--ink);
-    text-shadow: 0 1px 4px rgba(0,0,0,.8); display: none; }
-  body.cam .hint { display: block; }
+    text-shadow: 0 1px 4px rgba(0,0,0,.8); }
   .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px;
     min-height: 52px; padding: 0 22px; border-radius: 26px; border: 0; font: inherit; font-size: 16px;
     font-weight: 700; cursor: pointer; text-decoration: none; }
@@ -56,7 +74,8 @@
   .row .btn { flex: 1; }
   .mode { display: none; }
   #sheet[data-mode="busy"] .m-busy, #sheet[data-mode="result"] .m-result,
-  #sheet[data-mode="error"] .m-error, #sheet[data-mode="menu"] .m-menu { display: block; }
+  #sheet[data-mode="error"] .m-error, #sheet[data-mode="menu"] .m-menu,
+  #sheet[data-mode="photo"] .m-photo { display: block; }
   #sheet[data-mode="result"] .m-debug, #sheet[data-mode="error"] .m-debug { display: block; }
 
   #preview { display: flex; justify-content: center; margin: 4px 0 16px;
@@ -77,6 +96,7 @@
 <body>
 <video id="cam" playsinline muted autoplay></video>
 <div id="tank"></div>
+<div id="flash"></div>
 
 <header>
   <h1>スケッチアクアリウム<span id="count"></span></h1>
@@ -84,12 +104,11 @@
 </header>
 
 <div class="dock">
-  <p class="hint">四すみの ■ が全部入るように、少しななめから</p>
-  <button class="btn primary" id="btn-shoot">📷 撮る</button>
+  <p class="hint" id="hint"></p>
+  <button class="btn ghost round" id="btn-flip" aria-label="カメラ切り替え">🔄</button>
+  <button class="btn primary" id="btn-shoot">📷 読み取る</button>
+  <button class="btn ghost round" id="btn-photo" aria-label="写真を撮る">📸</button>
   <input id="in-camera" type="file" accept="image/*" capture="environment" hidden>
-  <label class="btn ghost">🖼 写真から
-    <input id="in-file" type="file" accept="image/*">
-  </label>
 </div>
 
 <div id="sheet" hidden>
@@ -100,10 +119,12 @@
     </div>
 
     <div class="mode m-result">
-      <h2>この魚を水槽に放つ？</h2>
+      <h2 id="result-title"></h2>
       <div id="preview"></div>
       <div class="row">
         <button class="btn ghost" id="btn-retake">撮り直す</button>
+        <button class="btn ghost" id="btn-skip">うらなしで放つ</button>
+        <button class="btn primary" id="btn-next">うらを読む →</button>
         <button class="btn primary" id="btn-release">🐟 放つ</button>
       </div>
     </div>
@@ -125,12 +146,32 @@
       </details>
     </div>
 
+    <div class="mode m-photo">
+      <h2>📸 写真</h2>
+      <img id="photo-img" alt="撮った写真">
+      <div class="row">
+        <button class="btn ghost" data-close>閉じる</button>
+        <button class="btn primary" id="btn-save-photo">保存・共有</button>
+      </div>
+    </div>
+
     <div class="mode m-menu">
       <h2>メニュー</h2>
-      <p>ぬりえを印刷して、魚を好きな色でぬってから「撮る」で撮影してください。
-        四すみの ■ が全部写るように、少しななめから撮るのがコツです。</p>
+      <p>読み取るもの</p>
+      <div class="seg">
+        <label><input type="radio" name="mode" value="balloon">🎈 バルーン</label>
+        <label><input type="radio" name="mode" value="paper">🐟 紙のさかな</label>
+      </div>
+      <p>読み取ると自動で切り替わります。バルーンは「おもて → うら」の順。点線の円の中はぬらないでね。</p>
       <div class="row" style="margin-bottom:10px">
-        <a class="btn ghost" href="template_A4.pdf" target="_blank" rel="noopener">📄 ぬりえ（A4）</a>
+        <label class="btn ghost">🖼 写真から
+          <input id="in-file" type="file" accept="image/*">
+        </label>
+        <button class="btn ghost" id="btn-restart-scan">↺ やり直す</button>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <a class="btn ghost" href="balloon_test_A4.pdf" target="_blank" rel="noopener">📄 バルーン A4</a>
+        <a class="btn ghost" href="template_A4.pdf" target="_blank" rel="noopener">📄 さかな A4</a>
       </div>
       <div class="row">
         <button class="btn ghost" id="btn-clear">🗑 ぜんぶ消す</button>
