@@ -169,7 +169,9 @@ async function main() {
 
   // ---- 状態
   let mode = pref.get();             // "balloon" | "paper"
-  let scan = { step: "front", front: null, back: null };   // バルーンの表→裏
+  // バルーン：step は「次に読む面」。表裏は読み取り後に自動判別するので、どちらから読んでもよい
+  let scan = { step: "front", front: null, back: null };
+  const SIDE = { front: "おもて", back: "うら" };
   let pending = null;                // 紙のさかな：放つ前のテクスチャ
 
   function updateCount() {
@@ -177,13 +179,44 @@ async function main() {
   }
   function updateHint() {
     $("#hint").textContent = mode === "paper"
-      ? "四すみの ■ が全部入るように、少しななめから"
+      ? "わくに合わせて、四すみの ■ が全部入るように"
       : scan.step === "front"
-        ? "🎈 おもて：■ 4つが全部入るように、少しななめから"
-        : "🎈 つぎは うら：裏返して ■ 4つを入れてね";
+        ? "🎈 おもて（あたまが左）を わくに合わせてね"
+        : "🎈 うら（あたまが右）を わくに合わせてね";
     $("#btn-shoot").textContent = mode === "paper" ? "📷 読み取る"
-      : scan.step === "front" ? "📷 おもてを読む" : "📷 うらを読む";
+      : `📷 ${SIDE[scan.step]}を読む`;
     for (const r of document.querySelectorAll("input[name=mode]")) r.checked = r.value === mode;
+    updateGuide();
+  }
+
+  /** カメラ画面に重ねる合わせ用のわく（バルーンは魚の輪郭 + マーカー、紙はカードの四角 + マーカー） */
+  function updateGuide() {
+    const svg = $("#guide");
+    const tpl = T[mode];
+    const back = mode === "balloon" && scan.step === "back";
+    const X = (x) => (back ? 1 - x : x);
+    let shape, box;
+    if (mode === "balloon" && tpl.guide) {
+      const pts = tpl.guide.map(([x, y]) => [X(x), y]);
+      const d = `M${pts.map((p) => p.join(",")).join(" L")} Z`;
+      shape = `<path d="${d}" class="g-shadow"/><path d="${d}" class="g-line"/>`;
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      box = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+    } else {
+      shape = `<rect x="0" y="0" width="1" height="1" class="g-shadow"/><rect x="0" y="0" width="1" height="1" class="g-line"/>`;
+      box = [0, 0, 1, 1];
+    }
+    const marks = Object.entries(tpl.markers).map(([k, [x, y]]) => {
+      const h = (k === "BR" ? tpl.markerSize.small : tpl.markerSize.large) / 2;
+      return `<rect x="${x - h}" y="${y - h}" width="${2 * h}" height="${2 * h}" class="g-mark"/>`;
+    }).join("");
+    const pad = 0.04;
+    const vb = [box[0] - pad, box[1] - pad, box[2] - box[0] + 2 * pad, box[3] - box[1] + 2 * pad];
+    svg.setAttribute("viewBox", vb.join(" "));
+    svg.innerHTML = shape + marks;
+    $("#guide-label").textContent = mode === "paper" ? "" :
+      back ? "うら（あたまが右）" : "おもて（あたまが左）";
+    $("#guide-wrap").dataset.side = mode === "paper" ? "paper" : scan.step;
   }
   updateCount();
   updateHint();
@@ -233,8 +266,10 @@ async function main() {
       openSheet("error");
       return r;
     }
+    // バルーンの表裏は輪郭線の位置で自動判別（判別できなければ「次に読む面」とみなす）
+    const side = mode === "balloon" ? (r.side && r.side.side) || scan.step : null;
     // 裏面は輪郭が左右反転しているので、反転して表と同じ座標系にそろえる
-    const image = mode === "balloon" && scan.step === "back" && tpl.backMirrored ? mirrorX(r.image) : r.image;
+    const image = side === "back" && tpl.backMirrored ? mirrorX(r.image) : r.image;
     const tex = canvasOf(tpl.texSize, tpl.texSize);
     tex.getContext("2d").putImageData(image, 0, 0);
     const ss = mode === "balloon" ? BALLOON_SAVE_SIZE : SAVE_SIZE;
@@ -243,25 +278,40 @@ async function main() {
     $("#debug-info").textContent =
       `しきい値 ${Math.round(r.debug.thr)} / 候補 ${r.debug.cands.length} 個 / ` +
       `白補正 R${r.gains[0].toFixed(2)} G${r.gains[1].toFixed(2)} B${r.gains[2].toFixed(2)} / ` +
-      `${full.width}×${full.height} / ${ms}ms`;
+      `${full.width}×${full.height} / ${ms}ms` +
+      (r.side ? ` / 表裏 ${r.side.side || "?"}（線の濃さ 表${r.side.front.toFixed(0)} 裏${r.side.back.toFixed(0)}）` : "");
 
     const previews = [];
     if (mode === "paper") {
       pending = save;
       previews.push(maskedPreview(tex, masks.flat));
       setResult("この魚を水槽に放つ？", ["retake", "release"]);
-    } else if (scan.step === "front") {
-      scan.front = save;
-      previews.push(maskedPreview(save, masks.balloon));
-      setResult("おもて OK！ つぎは うら", ["retake", "skip", "next"]);
     } else {
-      scan.back = save;
-      previews.push(maskedPreview(scan.front, masks.balloon), mirroredPreview(save, masks.balloon));
-      setResult("このバルーンを放つ？", ["retake", "release"]);
+      const wasExpected = side === scan.step;
+      scan[side] = save;
+      if (scan.front) previews.push(labeled(maskedPreview(scan.front, masks.balloon), "おもて"));
+      if (scan.back) previews.push(labeled(mirroredPreview(scan.back, masks.balloon), "うら"));
+      const note = wasExpected ? "" : `（${SIDE[side]}でした）`;
+      if (scan.front && scan.back) {
+        setResult(`${SIDE[side]} OK${note}！ このバルーンを放つ？`, ["retake", "release"]);
+      } else {
+        scan.step = side === "front" ? "back" : "front";
+        setResult(`${SIDE[side]} OK${note}！ つぎは ${SIDE[scan.step]}`, ["retake", "skip", "next"]);
+        $("#btn-next").textContent = `${SIDE[scan.step]}を読む →`;
+      }
+      updateHint();
     }
     $("#preview").replaceChildren(...previews);
     openSheet("result");
     return r;
+  }
+
+  function labeled(canvas, text) {
+    const fig = document.createElement("figure");
+    const cap = document.createElement("figcaption");
+    cap.textContent = text;
+    fig.append(canvas, cap);
+    return fig;
   }
 
   /** 裏はユーザーが見た向き（頭が右）で確認できるように、プレビューだけ反転して見せる */
@@ -308,12 +358,13 @@ async function main() {
       persist({ id, kind: "flat", ts: Date.now(), tex: pending.toDataURL("image/jpeg", SAVE_QUALITY) });
       pending = null;
     } else {
-      if (!scan.front) return;
-      const back = scan.back || scan.front;    // 裏なし → 表の絵を裏にも使う
-      aq.addBalloon(scan.front, back, { id, spawn: true });
+      if (!scan.front && !scan.back) return;
+      const front = scan.front || scan.back;   // 片面だけ → その絵を両面に使う
+      const back = scan.back || scan.front;
+      aq.addBalloon(front, back, { id, spawn: true });
       persist({
         id, kind: "balloon", model: modelId, ts: Date.now(),
-        tex: scan.front.toDataURL("image/jpeg", SAVE_QUALITY),
+        tex: front.toDataURL("image/jpeg", SAVE_QUALITY),
         back: back.toDataURL("image/jpeg", SAVE_QUALITY),
       });
       scan = { step: "front", front: null, back: null };
@@ -423,8 +474,8 @@ async function main() {
   $("#in-camera").addEventListener("change", onFile);
   $("#in-file").addEventListener("change", (e) => { closeSheet(); onFile(e); });
   $("#btn-release").addEventListener("click", release);
-  $("#btn-next").addEventListener("click", () => { scan.step = "back"; updateHint(); shoot(); });
-  $("#btn-skip").addEventListener("click", () => { scan.back = null; release(); });
+  $("#btn-next").addEventListener("click", shoot);   // scan.step はもう次の面になっている
+  $("#btn-skip").addEventListener("click", release);
   $("#btn-retake").addEventListener("click", shoot);
   $("#btn-retake2").addEventListener("click", shoot);
   for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", closeSheet);

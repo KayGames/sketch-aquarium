@@ -40,6 +40,23 @@
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent); color: var(--accent-ink); }
   .btn[hidden] { display: none; }
+  /* 合わせ用のわく（カメラ映像の上。読み取りのフレーム中央に置く） */
+  #guide-wrap { position: fixed; left: 50%; top: 46%; transform: translate(-50%, -50%);
+    width: min(86vw, 70vh * 1.5); pointer-events: none; display: none; text-align: center; }
+  body.cam #guide-wrap { display: block; }
+  #guide { width: 100%; height: auto; max-height: 56vh; overflow: visible; }
+  #guide .g-shadow { fill: none; stroke: rgba(0,0,0,.55); stroke-width: 0.016; }
+  #guide .g-line { fill: none; stroke: #fff; stroke-width: 0.007; stroke-dasharray: 0.03 0.015; }
+  #guide .g-mark { fill: none; stroke: var(--accent); stroke-width: 0.006; }
+  #guide-label { display: inline-block; margin-bottom: 6px; padding: 6px 14px; border-radius: 999px;
+    font-size: 18px; font-weight: 800; color: var(--accent-ink); background: var(--accent);
+    box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+  #guide-label:empty { display: none; }
+  #guide-wrap[data-side="back"] #guide-label { background: #7fd3ff; }
+  #guide-wrap[data-side="back"] .g-mark { stroke: #7fd3ff; }
+  #preview figure { flex: 1; min-width: 0; margin: 0; text-align: center; }
+  #preview figure canvas { width: 100%; height: auto; }
+  #preview figcaption { font-size: 13px; color: var(--sub); padding: 2px 0 6px; }
   .m-menu .btn { font-size: 14px; padding: 0 12px; white-space: nowrap; }
   #tank { position: fixed; inset: 0; }
   #tank canvas { display: block; }
@@ -96,6 +113,10 @@
 <body>
 <video id="cam" playsinline muted autoplay></video>
 <div id="tank"></div>
+<div id="guide-wrap" aria-hidden="true">
+  <div id="guide-label"></div>
+  <svg id="guide" preserveAspectRatio="xMidYMid meet"></svg>
+</div>
 <div id="flash"></div>
 
 <header>
@@ -123,7 +144,7 @@
       <div id="preview"></div>
       <div class="row">
         <button class="btn ghost" id="btn-retake">撮り直す</button>
-        <button class="btn ghost" id="btn-skip">うらなしで放つ</button>
+        <button class="btn ghost" id="btn-skip">片面だけで放つ</button>
         <button class="btn primary" id="btn-next">うらを読む →</button>
         <button class="btn primary" id="btn-release">🐟 放つ</button>
       </div>

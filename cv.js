@@ -371,5 +371,34 @@ export function extract(full, small, layout, det = null) {
   const gains = whiteGains(full, H, layout.whitePoints, layout.whiteRadius);
   const image = toImageData(rgb, N, gains);
   if (layout.inpaint) inpaintDiscs(image, layout.region, layout.inpaint);
-  return { ok: true, image, gains, H, debug: det.debug };
+  const side = layout.sideProbe ? detectSide(full, H, layout.sideProbe) : null;
+  return { ok: true, image, gains, H, side, debug: det.debug };
+}
+
+/**
+ * 表か裏か。マーカーは左右対称なので並びでは区別できない。
+ * 印刷された輪郭線（黒）が「表の輪郭」と「裏の輪郭（左右反転）」のどちらに乗っているかで決める。
+ * 両者が離れている所の点だけを使い、各点で近傍の一番暗い値を取る（位置合わせの数 px のずれを吸収）
+ * 戻り値 { side: "front"|"back"|null（判別できない）, front, back }（各輪郭上の平均の暗さ 0..255）
+ */
+export function detectSide(full, H, probe) {
+  const tmp = new Float32Array(3);
+  const darkAlong = (pts) => {
+    let sum = 0;
+    for (const [x, y] of pts) {
+      let mn = 255;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const [u, v] = applyH(H, x + dx * 0.002, y + dy * 0.002);
+        sampleInto(full, u, v, tmp, 0);
+        const g = (tmp[0] * 77 + tmp[1] * 150 + tmp[2] * 29) / 256;
+        if (g < mn) mn = g;
+      }
+      sum += mn;
+    }
+    return sum / pts.length;
+  };
+  const f = darkAlong(probe.front), b = darkAlong(probe.back);
+  // 差が小さい時（輪郭がつぶれるほど濃く塗った等）は決めない → 呼び出し側の想定（おもて→うらの順）に任せる
+  const side = Math.abs(f - b) < 12 ? null : f < b ? "front" : "back";
+  return { side, front: f, back: b };
 }
