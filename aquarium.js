@@ -32,7 +32,7 @@ const FISH_FRAG = /* glsl */ `
   }`;
 
 const BG_FRAG = /* glsl */ `
-  uniform float uTime;
+  uniform float uTime, uCamera;
   varying vec2 vUv;
   void main() {
     vec3 top = vec3(0.16, 0.62, 0.78), deep = vec3(0.02, 0.10, 0.25);
@@ -43,7 +43,15 @@ const BG_FRAG = /* glsl */ `
     r += pow(max(0.0, sin(sx * 23.0 + uTime * 0.35)), 18.0);
     r += 0.7 * pow(max(0.0, sin(sx * 37.0 - uTime * 0.27 + 1.3)), 24.0);
     r += 0.5 * pow(max(0.0, sin(sx * 13.0 + uTime * 0.18 + 4.0)), 30.0);
-    c += r * vec3(0.55, 0.85, 0.9) * smoothstep(0.15, 1.0, vUv.y) * 0.45;
+    float ray = r * smoothstep(0.15, 1.0, vUv.y);
+    if (uCamera > 0.5) {
+      // カメラ背景モード：うすい水色のベール + 光の筋だけを重ねる（現実の景色が水中っぽく見える）
+      float a = mix(0.10, 0.28, 1.0 - vUv.y) + ray * 0.22;
+      vec3 col = mix(vec3(0.05, 0.30, 0.45), vec3(0.75, 0.95, 1.0), clamp(ray, 0.0, 1.0));
+      gl_FragColor = vec4(col, a);
+      return;
+    }
+    c += ray * vec3(0.55, 0.85, 0.9) * 0.45;
     gl_FragColor = vec4(c, 1.0);
   }`;
 
@@ -72,7 +80,9 @@ function radialTexture(inner, outer) {
 export class Aquarium {
   constructor(container, maskImage) {
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });   // 背後のカメラ映像を透かす
+    this.renderer.setClearColor(0x000000, 0);
+    this.cameraMode = false;
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     container.appendChild(this.renderer.domElement);
 
@@ -101,7 +111,8 @@ export class Aquarium {
   // ------------------------------------------------------------ 環境
   _buildBackground() {
     this.bgMat = new THREE.ShaderMaterial({
-      uniforms: { uTime: { value: 0 } }, vertexShader: PASS_VERT, fragmentShader: BG_FRAG, depthWrite: false,
+      uniforms: { uTime: { value: 0 }, uCamera: { value: 0 } },
+      vertexShader: PASS_VERT, fragmentShader: BG_FRAG, depthWrite: false,
     });
     this.bg = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this.bgMat);
     this.bg.position.z = -12;
@@ -159,6 +170,16 @@ export class Aquarium {
     }
   }
 
+  /** true: 背景はカメラ映像（水のベールと光の筋だけ描く）／ false: 描いた水槽 */
+  setCameraMode(on) {
+    this.cameraMode = on;
+    this.bgMat.uniforms.uCamera.value = on ? 1 : 0;
+    this.bgMat.transparent = on;
+    this.bgMat.needsUpdate = true;
+    this.floor.visible = !on;           // カメラ映像には床がないので、床と床の影は出さない
+    for (const f of this.fish) f.shadow.visible = !on;
+  }
+
   resize() {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     this.renderer.setSize(w, h);
@@ -203,6 +224,7 @@ export class Aquarium {
     const shadow = new THREE.Mesh(new THREE.PlaneGeometry(1, 0.45),
       new THREE.MeshBasicMaterial({ map: this.shadowTex, transparent: true, depthWrite: false }));
     shadow.rotation.x = -Math.PI / 2;
+    shadow.visible = !this.cameraMode;
     this.scene.add(shadow);
 
     const b = this.bounds;

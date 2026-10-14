@@ -44,9 +44,15 @@ function canvasOf(w, h) {
   return c;
 }
 
+/** img でも video でも可 */
+function sizeOf(src) {
+  return src.videoWidth ? [src.videoWidth, src.videoHeight] : [src.naturalWidth, src.naturalHeight];
+}
+
 function drawScaled(img, long) {
-  const k = Math.min(1, long / Math.max(img.naturalWidth, img.naturalHeight));
-  const c = canvasOf(Math.round(img.naturalWidth * k), Math.round(img.naturalHeight * k));
+  const [w, h] = sizeOf(img);
+  const k = Math.min(1, long / Math.max(w, h));
+  const c = canvasOf(Math.round(w * k), Math.round(h * k));
   const g = c.getContext("2d", { willReadFrequently: true });
   g.drawImage(img, 0, 0, c.width, c.height);
   return g.getImageData(0, 0, c.width, c.height);
@@ -144,11 +150,25 @@ async function main() {
 
   let pending = null;   // 放つ前の抽出結果
 
+  /** src: 画像 URL か、すでに描画できる要素（カメラの video） */
   async function processSource(src) {
+    // video は「読み取り中」を出す前にフレームを固定する（シートを描く間に絵が動かないように）
+    const img = typeof src === "string" ? null : frameOf(src);
     openSheet("busy");
     await new Promise((r) => setTimeout(r, 30));   // 「読み取り中」を先に描画させる
     const t0 = performance.now();
-    const img = await loadImage(src);
+    const pic = img || await loadImage(src);
+    return processImage(pic, t0);
+  }
+
+  function frameOf(video) {
+    const c = canvasOf(video.videoWidth, video.videoHeight);
+    c.getContext("2d").drawImage(video, 0, 0);
+    c.naturalWidth = c.width; c.naturalHeight = c.height;
+    return c;
+  }
+
+  function processImage(img, t0) {
     const full = drawScaled(img, FULL_LONG_MAX);
     const small = drawScaled(img, DETECT_LONG);
     const r = extract(full, small, layout);
@@ -201,12 +221,49 @@ async function main() {
     updateCount();
   }
 
+  // ---- カメラ映像を背景に。撮影も同じストリームから1フレーム取る
+  // （ストリーム中に <input capture> で標準カメラを開くと、機種によってはカメラの取り合いになる）
+  const video = $("#cam");
+  let camOn = false;
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+      });
+      video.srcObject = stream;
+      await video.play();
+      camOn = true;
+    } catch (e) {
+      console.warn("camera unavailable:", e);
+      camOn = false;
+    }
+    document.body.classList.toggle("cam", camOn);
+    aq.setCameraMode(camOn);
+    return camOn;
+  }
+  startCamera();
+
+  function shoot() {
+    closeSheet();
+    if (camOn && video.videoWidth) {
+      processSource(video).catch((err) => {
+        $("#err-msg").textContent = "読み取りに失敗しました：" + err.message;
+        openSheet("error");
+      });
+    } else {
+      $("#in-camera").click();   // カメラが使えない時は端末の標準カメラ
+    }
+  }
+
+  $("#btn-shoot").addEventListener("click", shoot);
   $("#in-camera").addEventListener("change", onFile);
   $("#in-file").addEventListener("change", onFile);
   $("#btn-release").addEventListener("click", release);
   for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", closeSheet);
-  $("#btn-retake").addEventListener("click", () => { closeSheet(); $("#in-camera").click(); });
-  $("#btn-retake2").addEventListener("click", () => { closeSheet(); $("#in-camera").click(); });
+  $("#btn-retake").addEventListener("click", shoot);
+  $("#btn-retake2").addEventListener("click", shoot);
   $("#btn-menu").addEventListener("click", () => openSheet("menu"));
   $("#btn-clear").addEventListener("click", () => {
     if (!confirm("水槽の魚をぜんぶ消します。よろしいですか？")) return;
@@ -218,7 +275,7 @@ async function main() {
   });
 
   // 検証用フック（Phase 1/2 の回帰テスト・実測で使う）
-  window.__aquarium = { processURL: processSource, release, aq, layout };
+  window.__aquarium = { processURL: processSource, release, aq, layout, startCamera };
 }
 
 main().catch((e) => {
