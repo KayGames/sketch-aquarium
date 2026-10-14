@@ -1,9 +1,10 @@
 // スケッチアクアリウム（バルーン版）— 読み取り → 水槽（紙のさかな / 3D バルーン）→ 記念写真
-import { Aquarium } from "./aquarium.js";
+import { Aquarium, loadBalloonModel } from "./aquarium.js";
 import { extractAuto, mirrorX, DETECT_LONG } from "./cv.js";
 
 const FULL_LONG_MAX = 3000;     // 原寸サンプリング用。iOS のキャンバス面積上限対策で長辺を抑える
-const SAVE_SIZE = 384;          // §6-6 保存テクスチャ
+const SAVE_SIZE = 384;          // §6-6 保存テクスチャ（紙のさかな）
+const BALLOON_SAVE_SIZE = 512;  // バルーンは 3D で大きく見えるので高め（表裏で約 100KB）
 const SAVE_QUALITY = 0.8;
 const MAX_FISH = 20;
 const STORE_KEY = "sketchAquarium.fish.v1";
@@ -104,20 +105,20 @@ function debugCanvas(dbg) {
 }
 
 // ------------------------------------------------------------------ デモ（水槽が空の時だけ）
-function demoTexture(hue, eye) {
-  const c = canvasOf(SAVE_SIZE, SAVE_SIZE);
+function demoTexture(hue, eye, S = SAVE_SIZE) {
+  const c = canvasOf(S, S);
   const g = c.getContext("2d");
-  const gr = g.createLinearGradient(0, 0, SAVE_SIZE, SAVE_SIZE * 0.4);
+  const gr = g.createLinearGradient(0, 0, S, S * 0.4);
   gr.addColorStop(0, `hsl(${hue},85%,60%)`);
   gr.addColorStop(1, `hsl(${(hue + 50) % 360},85%,55%)`);
   g.fillStyle = gr;
-  g.fillRect(0, 0, SAVE_SIZE, SAVE_SIZE);
+  g.fillRect(0, 0, S, S);
   g.fillStyle = `hsla(${(hue + 180) % 360},80%,70%,0.8)`;
-  for (let i = 0; i < 3; i++) g.fillRect(SAVE_SIZE * (0.33 + i * 0.13), 0, SAVE_SIZE * 0.05, SAVE_SIZE);
+  for (let i = 0; i < 3; i++) g.fillRect(S * (0.33 + i * 0.13), 0, S * 0.05, S);
   g.fillStyle = "#fff";
-  g.beginPath(); g.arc(SAVE_SIZE * eye[0], SAVE_SIZE * eye[1], SAVE_SIZE * 0.035, 0, 7); g.fill();
+  g.beginPath(); g.arc(S * eye[0], S * eye[1], S * 0.035, 0, 7); g.fill();
   g.fillStyle = "#111";
-  g.beginPath(); g.arc(SAVE_SIZE * (eye[0] + 0.005), SAVE_SIZE * (eye[1] + 0.005), SAVE_SIZE * 0.016, 0, 7); g.fill();
+  g.beginPath(); g.arc(S * (eye[0] + 0.005), S * (eye[1] + 0.005), S * 0.016, 0, 7); g.fill();
   return c;
 }
 
@@ -137,9 +138,19 @@ async function main() {
     flat: await loadImage(T.paper.mask),
     balloon: await loadImage(T.balloon.mask),
   };
-  const aq = new Aquarium($("#tank"), masks);
+  const modelId = T.balloon.model ? T.balloon.model.id : null;
+  let model = null, atlasMask = null;
+  if (T.balloon.model) {
+    try {
+      model = await loadBalloonModel(T.balloon.model.obj);
+      const am = T.balloon.model.atlasMask;
+      if (am) atlasMask = { front: await loadImage(am.front), back: await loadImage(am.back) };
+    } catch (e) { console.warn("balloon model unavailable, using pillow mesh:", e); }
+  }
+  const aq = new Aquarium($("#tank"), masks, { tpl: T.balloon, model, atlasMask });
 
-  let saved = store.load();
+  // 別の形（テンプレート）で読んだバルーンは貼り方が合わないので出さない
+  let saved = store.load().filter((f) => f.kind !== "balloon" || f.model === modelId);
   for (const f of saved) {
     try {
       if (f.kind === "balloon") aq.addBalloon(await loadImage(f.tex), await loadImage(f.back), { id: f.id });
@@ -147,9 +158,11 @@ async function main() {
     } catch { /* 壊れたデータは無視 */ }
   }
   if (!saved.length) {
+    const [rx0, ry0, rx1, ry1] = T.balloon.region;
+    const eye = [(T.balloon.eye[0] - rx0) / (rx1 - rx0), (T.balloon.eye[1] - ry0) / (ry1 - ry0)];
     [20, 200].forEach((h, i) => {
-      const t = demoTexture(h, [0.14, 0.42]);
-      aq.addBalloon(t, t, { id: "demo-b" + i });
+      const t = demoTexture(h, eye, BALLOON_SAVE_SIZE);
+      aq.addBalloon(t, t, { id: "demo-b" + i });   // 裏も表の座標系なので同じ絵でよい
     });
     aq.addFish(demoTexture(320, [0.17, 0.43]), { id: "demo-f" });
   }
@@ -224,8 +237,9 @@ async function main() {
     const image = mode === "balloon" && scan.step === "back" && tpl.backMirrored ? mirrorX(r.image) : r.image;
     const tex = canvasOf(tpl.texSize, tpl.texSize);
     tex.getContext("2d").putImageData(image, 0, 0);
-    const save = canvasOf(SAVE_SIZE, SAVE_SIZE);
-    save.getContext("2d").drawImage(tex, 0, 0, SAVE_SIZE, SAVE_SIZE);
+    const ss = mode === "balloon" ? BALLOON_SAVE_SIZE : SAVE_SIZE;
+    const save = canvasOf(ss, ss);
+    save.getContext("2d").drawImage(tex, 0, 0, ss, ss);
     $("#debug-info").textContent =
       `しきい値 ${Math.round(r.debug.thr)} / 候補 ${r.debug.cands.length} 個 / ` +
       `白補正 R${r.gains[0].toFixed(2)} G${r.gains[1].toFixed(2)} B${r.gains[2].toFixed(2)} / ` +
@@ -298,7 +312,7 @@ async function main() {
       const back = scan.back || scan.front;    // 裏なし → 表の絵を裏にも使う
       aq.addBalloon(scan.front, back, { id, spawn: true });
       persist({
-        id, kind: "balloon", ts: Date.now(),
+        id, kind: "balloon", model: modelId, ts: Date.now(),
         tex: scan.front.toDataURL("image/jpeg", SAVE_QUALITY),
         back: back.toDataURL("image/jpeg", SAVE_QUALITY),
       });

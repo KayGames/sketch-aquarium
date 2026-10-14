@@ -1,6 +1,28 @@
 // 水槽シーン（仕様 §3[8], §6-5）
 import * as THREE from "three";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+
+/**
+ * 膨張モデル（Blender 書き出しの OBJ）を読む。
+ * OBJ の軸は x=頭→尾、y=厚み（表が -y）、z=上。X 軸まわりに -90° 回して 表 = +Z・上 = +Y にし、
+ * 幅 1・中心 0 に正規化する（魚の板ポリと同じ大きさの扱いになる）
+ */
+export async function loadBalloonModel(url) {
+  const root = await new OBJLoader().loadAsync(url);
+  let geo = null;
+  root.traverse((o) => { if (!geo && o.isMesh) geo = o.geometry; });
+  if (!geo) throw new Error("OBJ にメッシュがありません");
+  geo.rotateX(-Math.PI / 2);
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox, c = new THREE.Vector3();
+  bb.getCenter(c);
+  geo.translate(-c.x, -c.y, -c.z);
+  const k = 1 / (bb.max.x - bb.min.x);
+  geo.scale(k, k, k);
+  if (!geo.attributes.normal) geo.computeVertexNormals();
+  return geo;
+}
 
 const FISH_VERT = /* glsl */ `
   uniform float uTime, uSpeed, uWaveLength, uMaxAmp, uPhase0;
@@ -140,7 +162,11 @@ function buildBalloonGeometry(maskImg, G = 128, puff = 0.14) {
 
 export class Aquarium {
   /** masks: { flat: 紙のさかなのマスク画像, balloon: バルーンのマスク画像 } */
-  constructor(container, masks) {
+  constructor(container, masks, balloon = {}) {
+    // balloon: { tpl: layout のバルーンテンプレート, model: loadBalloonModel() の結果（無ければ枕型） }
+    this.balloonTpl = balloon.tpl;
+    this.balloonModel = balloon.model || null;
+    this.atlasMask = balloon.atlasMask || null;
     this.container = container;
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });   // 背後のカメラ映像を透かす
     this.renderer.setClearColor(0x000000, 0);
@@ -291,7 +317,8 @@ export class Aquarium {
   }
 
   /**
-   * 3D バルーン。front/back はどちらも表と同じ向き（頭が左）の絵。裏は呼び出し側で左右反転済み
+   * 3D バルーン。front/back はどちらも表と同じ向き（頭が左）の絵。裏は呼び出し側で左右反転済み。
+   * 膨張モデル（OBJ）があれば、その UV 島（表・裏）にアトラスとして貼る。無ければ枕型メッシュ。
    */
   addBalloon(frontSource, backSource, opt = {}) {
     // くねり：魚と同じ式を MeshPhysicalMaterial の頂点処理に差し込む（表裏で同じ uniform を共有）
@@ -300,31 +327,78 @@ export class Aquarium {
       uMaxAmp: { value: 0.12 }, uPhase0: { value: Math.random() * 6.28 },
     };
     const textures = [];
-    const makeMat = (src) => {
-      const map = new THREE.Texture(src);
+    // wxExpr: 頭=0, 尾=1 になる式。枕型は uv.x、OBJ はアトラス UV なので位置 x（幅1・中心0に正規化済み）
+    const makeMat = (src, wxExpr, alpha) => {
+      const map = src.isTexture ? src : new THREE.Texture(src);
       map.colorSpace = THREE.SRGBColorSpace;
       map.anisotropy = 4;
       map.needsUpdate = true;
       textures.push(map);
       const mat = new THREE.MeshPhysicalMaterial({
-        map, alphaMap: this.balloonMask, alphaTest: 0.5,
-        roughness: 0.42, clearcoat: 0.8, clearcoatRoughness: 0.22, envMapIntensity: 0.75,
+        map, roughness: 0.42, clearcoat: 0.8, clearcoatRoughness: 0.22, envMapIntensity: 0.75,
+        ...(alpha ? { alphaMap: this.balloonMask, alphaTest: 0.5 } : {}),
       });
       mat.onBeforeCompile = (sh) => {
         Object.assign(sh.uniforms, wag);
         sh.vertexShader = "uniform float uTime, uSpeed, uWaveLength, uMaxAmp, uPhase0;\n" +
           sh.vertexShader.replace("#include <begin_vertex>", `#include <begin_vertex>
-            { float wx = uv.x;   // 0=頭, 1=尾
+            { float wx = ${wxExpr};
               transformed.z += sin(uTime * uSpeed - wx * uWaveLength + uPhase0) * wx * wx * uMaxAmp; }`);
       };
+      mat.customProgramCacheKey = () => "wag:" + wxExpr;
       return mat;
     };
-    const fm = makeMat(frontSource), bm = makeMat(backSource);
-    const group = new THREE.Group();
-    group.add(new THREE.Mesh(this.balloonGeo.front, fm), new THREE.Mesh(this.balloonGeo.back, bm));
-    return this._addCreature(group, wag, () => {
-      textures.forEach((t) => t.dispose()); fm.dispose(); bm.dispose();
+
+    let obj, mats;
+    if (this.balloonModel) {
+      const atlas = new THREE.CanvasTexture(this._balloonAtlas(frontSource, backSource));
+      const m = makeMat(atlas, "clamp(position.x + 0.5, 0.0, 1.0)", false);
+      obj = new THREE.Mesh(this.balloonModel, m);
+      mats = [m];
+    } else {
+      const fm = makeMat(frontSource, "uv.x", true), bm = makeMat(backSource, "uv.x", true);
+      obj = new THREE.Group();
+      obj.add(new THREE.Mesh(this.balloonGeo.front, fm), new THREE.Mesh(this.balloonGeo.back, bm));
+      mats = [fm, bm];
+    }
+    return this._addCreature(obj, wag, () => {
+      textures.forEach((t) => t.dispose()); mats.forEach((m) => m.dispose());
     }, opt, { cruise: 0.6 + Math.random() * 0.4, bob: 0.12 });
+  }
+
+  /**
+   * 表・裏の絵（テンプレートの切り出し範囲そのまま）を OBJ の UV アトラスに並べる。
+   * 変換（テンプレ座標 → アトラス画素）は template_gen.py が下絵と UV 島を位置合わせして layout.json に書いたもの
+   */
+  _balloonAtlas(front, back) {
+    const tpl = this.balloonTpl, model = tpl.model;
+    const [x0, y0, x1, y1] = tpl.region;
+    const S = model.atlas;
+    const c = document.createElement("canvas");
+    c.width = c.height = S;
+    const g = c.getContext("2d");
+    g.fillStyle = "#1c1c1c";    // UV 島の外（縁の帯の面が使う細い帯）は印刷の輪郭線の色
+    g.fillRect(0, 0, S, S);
+    const layer = document.createElement("canvas");
+    layer.width = layer.height = S;
+    const lg = layer.getContext("2d");
+    for (const [img, A, side] of [[front, model.front, "front"], [back, model.back, "back"]]) {
+      const sx = (x1 - x0) / img.width, sy = (y1 - y0) / img.height;
+      lg.globalCompositeOperation = "source-over";
+      lg.clearRect(0, 0, S, S);
+      // 画素 (i,j) → テンプレ (x0 + i·sx, y0 + j·sy) → アトラス A
+      lg.setTransform(A[0] * sx, A[3] * sx, A[1] * sy, A[4] * sy,
+        A[0] * x0 + A[1] * y0 + A[2], A[3] * x0 + A[4] * y0 + A[5]);
+      lg.drawImage(img, 0, 0);
+      lg.setTransform(1, 0, 0, 1, 0, 0);
+      // 切り出し正方形は相手の島にもかかるので、自分の島の形で切ってから重ねる
+      if (this.atlasMask && this.atlasMask[side]) {
+        lg.globalCompositeOperation = "destination-in";
+        lg.drawImage(this.atlasMask[side], 0, 0, S, S);
+      }
+      g.drawImage(layer, 0, 0);
+    }
+    return c;
   }
 
   _addCreature(obj, u, dispose, opt, extra) {
